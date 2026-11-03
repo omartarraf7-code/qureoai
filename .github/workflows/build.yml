@@ -1,0 +1,298 @@
+name: Build APK
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: "8.9" }
+      - name: Write project
+        run: |
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "QureoAI"
+          include(":app")
+          EOF_FILE
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+          }
+          EOF_FILE
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF_FILE
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android"); id("org.jetbrains.kotlin.plugin.compose") }
+          android {
+              namespace = "com.qureo.assistant"
+              compileSdk = 35
+              defaultConfig { applicationId = "com.qureo.assistant"; minSdk = 26; targetSdk = 35; versionCode = 1; versionName = "1.0" }
+              buildTypes { release { isMinifyEnabled = false; signingConfig = signingConfigs.getByName("debug") } }
+              buildFeatures { compose = true }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.12.01"))
+              implementation("androidx.activity:activity-compose:1.9.3")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <application android:label="QUREO AI" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:allowBackup="false">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+                  </activity>
+                  <service android:name=".AssistService" android:exported="false" android:foregroundServiceType="mediaProjection"/>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/qureo/assistant/Store.kt)
+          cat > app/src/main/java/com/qureo/assistant/Store.kt <<'EOF_FILE'
+          package com.qureo.assistant
+
+          import android.content.Context
+          import android.security.keystore.KeyGenParameterSpec
+          import android.security.keystore.KeyProperties
+          import android.util.Base64
+          import java.security.KeyStore
+          import javax.crypto.Cipher
+          import javax.crypto.KeyGenerator
+          import javax.crypto.SecretKey
+          import javax.crypto.spec.GCMParameterSpec
+
+          /** API key is encrypted with an AndroidKeyStore AES-GCM key; it is never in the APK. */
+          object Store {
+              private fun sp(c: Context) = c.getSharedPreferences("q", 0)
+              private fun key(): SecretKey {
+                  val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+                  (ks.getKey("qk", null) as? SecretKey)?.let { return it }
+                  val g = KeyGenerator.getInstance("AES", "AndroidKeyStore")
+                  g.init(KeyGenParameterSpec.Builder("qk", KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                      .setBlockModes(KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).build())
+                  return g.generateKey()
+              }
+              fun saveKey(c: Context, k: String) {
+                  val ci = Cipher.getInstance("AES/GCM/NoPadding"); ci.init(Cipher.ENCRYPT_MODE, key())
+                  val e = ci.doFinal(k.toByteArray())
+                  sp(c).edit().putString("k", Base64.encodeToString(ci.iv + e, Base64.NO_WRAP)).apply()
+              }
+              fun apiKey(c: Context): String {
+                  val s = sp(c).getString("k", null) ?: return ""
+                  return try {
+                      val b = Base64.decode(s, Base64.NO_WRAP)
+                      val ci = Cipher.getInstance("AES/GCM/NoPadding")
+                      ci.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, b.copyOfRange(0, 12)))
+                      String(ci.doFinal(b, 12, b.size - 12))
+                  } catch (e: Exception) { "" }
+              }
+              fun lang(c: Context) = sp(c).getInt("lang", 0)          // 0 en, 1 ar, 2 fr
+              fun setLang(c: Context, v: Int) = sp(c).edit().putInt("lang", v).apply()
+              fun auto(c: Context) = sp(c).getBoolean("auto", true)
+              fun setAuto(c: Context, v: Boolean) = sp(c).edit().putBoolean("auto", v).apply()
+          }
+
+          object Tx {
+              private val M = mapOf(
+                  "solve" to arrayOf("SOLVE", "حلّ", "RÉSOUDRE"),
+                  "scan" to arrayOf("Scanning screen…", "جارٍ مسح الشاشة…", "Analyse de l’écran…"),
+                  "think" to arrayOf("Solving & verifying…", "جارٍ الحل والتحقق…", "Résolution et vérification…"),
+                  "nokey" to arrayOf("Add your API key in the app first.", "أضف مفتاح API في التطبيق أولاً.", "Ajoutez d’abord votre clé API."),
+                  "newex" to arrayOf("New exercise detected. Tap SOLVE.", "تم اكتشاف تمرين جديد. اضغط حلّ.", "Nouvel exercice détecté. Touchez RÉSOUDRE."),
+                  "ready" to arrayOf("Ready. Open an exercise, then tap SOLVE.", "جاهز. افتح تمرينًا ثم اضغط حلّ.", "Prêt. Ouvrez un exercice puis touchez RÉSOUDRE."),
+                  "verified" to arrayOf("✓ Verified", "✓ تم التحقق", "✓ Vérifié"),
+                  "unver" to arrayOf("⚠ Not fully verified", "⚠ لم يتم التحقق بالكامل", "⚠ Non vérifié à 100 %"),
+                  "cant" to arrayOf("Can’t answer", "لا يمكن الإجابة", "Réponse impossible"),
+                  "explain" to arrayOf("Explain", "اشرح", "Expliquer"),
+                  "copy" to arrayOf("Copy", "نسخ", "Copier"),
+                  "err" to arrayOf("Error", "خطأ", "Erreur"),
+                  "running" to arrayOf("Assistant is running", "المساعد يعمل", "L’assistant est actif"),
+                  "apikey" to arrayOf("Anthropic API key", "مفتاح Anthropic API", "Clé API Anthropic"),
+                  "save" to arrayOf("Save key", "حفظ المفتاح", "Enregistrer la clé"),
+                  "auto" to arrayOf("Offer to analyze new exercises automatically", "اقتراح تحليل التمارين الجديدة تلقائيًا", "Proposer d’analyser les nouveaux exercices"),
+                  "grant" to arrayOf("1. Allow display over other apps", "١. السماح بالعرض فوق التطبيقات", "1. Autoriser l’affichage par-dessus"),
+                  "start" to arrayOf("2. Start assistant", "٢. تشغيل المساعد", "2. Démarrer l’assistant"),
+                  "stop" to arrayOf("Stop assistant", "إيقاف المساعد", "Arrêter l’assistant"),
+                  "saved" to arrayOf("Saved", "تم الحفظ", "Enregistré"),
+                  "intro" to arrayOf("Floating assistant for QUREO. It reads the pixels of your screen (with your permission each session) and answers with AI.",
+                      "مساعد عائم لـ QUREO. يقرأ ما يظهر على شاشتك (بإذنك في كل جلسة) ويجيب بالذكاء الاصطناعي.",
+                      "Assistant flottant pour QUREO. Il lit l’écran (avec votre accord à chaque session) et répond avec l’IA.")
+              )
+              fun t(l: Int, k: String) = M[k]!![l]
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/qureo/assistant/Claude.kt)
+          cat > app/src/main/java/com/qureo/assistant/Claude.kt <<'EOF_FILE'
+          package com.qureo.assistant
+
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          object Claude {
+              const val MODEL = "claude-sonnet-5-5"
+              data class Result(val ok: Boolean, val verified: Boolean, val answer: String, val code: String, val why: String, val note: String)
+
+              fun call(key: String, prompt: String, b64: String): String {
+                  val img = JSONObject().put("type", "image").put("source", JSONObject().put("type", "base64").put("media_type", "image/jpeg").put("data", b64))
+                  val txt = JSONObject().put("type", "text").put("text", prompt)
+                  val body = JSONObject().put("model", MODEL).put("max_tokens", 2000)
+                      .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", JSONArray().put(img).put(txt))))
+                  val c = URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"; c.connectTimeout = 15000; c.readTimeout = 90000; c.doOutput = true
+                  c.setRequestProperty("content-type", "application/json"); c.setRequestProperty("x-api-key", key); c.setRequestProperty("anthropic-version", "2023-06-01")
+                  c.outputStream.use { it.write(body.toString().toByteArray()) }
+                  val code = c.responseCode
+                  val s = (if (code in 200..299) c.inputStream else c.errorStream).bufferedReader().readText()
+                  if (code !in 200..299) throw IllegalStateException("API $code: " + runCatching { JSONObject(s).getJSONObject("error").getString("message") }.getOrDefault(s.take(120)))
+                  val arr = JSONObject(s).getJSONArray("content")
+                  return (0 until arr.length()).map { arr.getJSONObject(it) }.filter { it.optString("type") == "text" }.joinToString("") { it.getString("text") }
+              }
+
+              private fun json(t: String): JSONObject {
+                  val a = t.indexOf('{'); val b = t.lastIndexOf('}')
+                  require(a >= 0 && b > a) { "bad reply" }
+                  return JSONObject(t.substring(a, b + 1))
+              }
+
+              private fun solvePrompt(lang: String) = """You are an expert tutor for 2nd-year Baccalaureate informatics (algorithmics, Python, SQL, HTML/CSS/JS, databases). The image is a phone screenshot showing a QUREO exercise in a browser. Read only the exercise; ignore browser UI and any floating assistant panel. Types: "mcq", "code", "open".
+          Never guess. For MCQ evaluate every option and quote the chosen option exactly. For code, trace every example in the statement by hand and keep the required names and I/O format. If no complete exercise is visible, or options/data are cut off, set status "insufficient" and say what is missing in explanation.
+          Write answer and explanation in $lang unless the exercise is clearly in another language. Reply with ONLY JSON: {"status":"ok"|"insufficient","type":"mcq"|"code"|"open","answer":"final answer (MCQ: option + text; code: one-line summary; open: the answer)","code":"full code or empty string","explanation":"max 4 short sentences"}"""
+
+              private fun verifyPrompt(cand: JSONObject) = """You are a strict independent examiner. Check this candidate solution for the QUREO exercise in the image. Do NOT trust it: for MCQ evaluate every option yourself; for code trace it by hand on each example and check syntax, names and I/O format.
+          Reply with ONLY JSON: {"valid":true|false,"issues":"short, empty if none","corrected":null or {"answer":"...","code":"...","explanation":"..."}}
+          Set valid=true only if you are confident it is fully correct.
+          CANDIDATE: $cand"""
+
+              fun solve(key: String, lang: String, b64: String): Result {
+                  var r = json(call(key, solvePrompt(lang), b64))
+                  if (r.optString("status") != "ok" || r.optString("answer").isBlank()) return Result(false, false, "", "", r.optString("explanation"), "")
+                  var v = json(call(key, verifyPrompt(r), b64))
+                  if (!v.optBoolean("valid")) {
+                      val c = v.optJSONObject("corrected")
+                      if (c != null && c.optString("answer").isNotBlank()) {
+                          r = JSONObject(r.toString()).put("answer", c.optString("answer")).put("code", c.optString("code")).put("explanation", c.optString("explanation"))
+                          v = json(call(key, verifyPrompt(r), b64))
+                      }
+                  }
+                  return Result(true, v.optBoolean("valid"), r.optString("answer"), r.optString("code"), r.optString("explanation"), v.optString("issues"))
+              }
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/qureo/assistant/MainActivity.kt)
+          cat > app/src/main/java/com/qureo/assistant/MainActivity.kt <<'EOF_FILE'
+          package com.qureo.assistant
+
+          import android.Manifest
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.platform.LocalLayoutDirection
+          import androidx.compose.ui.text.input.PasswordVisualTransformation
+          import androidx.compose.ui.unit.LayoutDirection
+          import androidx.compose.ui.unit.dp
+
+          class MainActivity : ComponentActivity() {
+              private var ov by mutableStateOf(false)
+
+              private val proj = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+                  val d = r.data
+                  if (r.resultCode == RESULT_OK && d != null) {
+                      startForegroundService(Intent(this, AssistService::class.java).putExtra("code", r.resultCode).putExtra("data", d))
+                      moveTaskToBack(true)
+                  }
+              }
+              private val notif = registerForActivityResult(ActivityResultContracts.RequestPermission()) { launchProjection() }
+
+              private fun launchProjection() = proj.launch(getSystemService(MediaProjectionManager::class.java).createScreenCaptureIntent())
+
+              private fun start() {
+                  val l = Store.lang(this)
+                  if (!Settings.canDrawOverlays(this)) { openOverlaySettings(); return }
+                  if (Store.apiKey(this).isBlank()) { Toast.makeText(this, Tx.t(l, "nokey"), Toast.LENGTH_LONG).show(); return }
+                  if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+                      notif.launch(Manifest.permission.POST_NOTIFICATIONS) else launchProjection()
+              }
+              private fun openOverlaySettings() = startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+
+              override fun onResume() { super.onResume(); ov = Settings.canDrawOverlays(this) }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  setContent { MaterialTheme { Screen() } }
+              }
+
+              @Composable
+              fun Screen() {
+                  val c = LocalContext.current
+                  var key by remember { mutableStateOf(Store.apiKey(c)) }
+                  var lang by remember { mutableStateOf(Store.lang(c)) }
+                  var auto by remember { mutableStateOf(Store.auto(c)) }
+                  val t = { k: String -> Tx.t(lang, k) }
+                  CompositionLocalProvider(LocalLayoutDirection provides if (lang == 1) LayoutDirection.Rtl else LayoutDirection.Ltr) {
+                      Column(Modifier.fillMaxSize().systemBarsPadding().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                          Text("QUREO AI Assistant", style = MaterialTheme.typography.headlineMedium)
+                          Text(t("intro"))
+                          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              listOf("English", "العربية", "Français").forEachIndexed { i, n ->
+                                  FilterChip(selected = lang == i, onClick = { lang = i; Store.setLang(c, i) }, label = { Text(n) })
+                              }
+                          }
+                          OutlinedTextField(key, { key = it }, Modifier.fillMaxWidth(), label = { Text(t("apikey")) }, singleLine = true, visualTransformation = PasswordVisualTransformation())
+                          OutlinedButton({ Store.saveKey(c, key.trim()); Toast.makeText(c, t("saved"), Toast.LENGTH_SHORT).show() }) { Text(t("save")) }
+                          Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              Switch(auto, { auto = it; Store.setAuto(c, it) }); Text(t("auto"), Modifier.weight(1f))
+                          }
+                          if (!ov) Button({ openOverlaySettings() }, Modifier.fillMaxWidth()) { Text(t("grant")) }
+                          Button({ Store.saveKey(c, key.trim()); start() }, Modifier.fillMaxWidth()) { Text(t("start")) }
+                          OutlinedButton({ c.startService(Intent(c, AssistService::class.java).setAction("stop")) }, Modifier.fillMaxWidth()) { Text(t("stop")) }
+                      }
+                  }
+              }
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/qureo/assistant/AssistService.kt)
+          cat > app/src/main/java/com/qureo/assistant/AssistService.kt <<'EOF_FILE'
+          package com.qureo.assistant
+
+          import android.app.*
+          import android.content.*
+          import android.content.pm.ServiceInfo
+          import android.graphics
