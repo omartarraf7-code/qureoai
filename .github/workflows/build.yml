@@ -295,4 +295,258 @@ jobs:
           import android.app.*
           import android.content.*
           import android.content.pm.ServiceInfo
-          import android.graphics
+          import android.graphics.*
+          import android.graphics.drawable.GradientDrawable
+          import android.graphics.drawable.Icon
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.Image
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.*
+          import android.util.Base64
+          import android.view.*
+          import android.widget.*
+          import androidx.core.content.IntentCompat
+          import kotlinx.coroutines.*
+          import java.io.ByteArrayOutputStream
+          import kotlin.math.abs
+
+          class AssistService : Service() {
+              private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+              private lateinit var wm: WindowManager
+              private var mp: MediaProjection? = null
+              private var vd: VirtualDisplay? = null
+              private var ir: ImageReader? = null
+              private var held: Image? = null
+              private var bubble: TextView? = null
+              private var panel: LinearLayout? = null
+              private lateinit var status: TextView
+              private lateinit var ansTv: TextView
+              private lateinit var codeTv: TextView
+              private lateinit var scroll: ScrollView
+              private lateinit var actions: LinearLayout
+              private lateinit var solveBtn: Button
+              private var last: Claude.Result? = null
+              private var showWhy = false
+              private var busy = false
+              private var lang = 0
+              private var w = 0
+              private var h = 0
+              private var sigPrev: IntArray? = null
+              private var moving = false
+
+              private fun t(k: String) = Tx.t(lang, k)
+              private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
+              private fun round(c: Int, r: Float) = GradientDrawable().apply { setColor(c); cornerRadius = r }
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  if (i == null || i.action == "stop") { stopSelf(); return START_NOT_STICKY }
+                  if (mp != null) return START_NOT_STICKY
+                  lang = Store.lang(this)
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("q", "QUREO AI", NotificationManager.IMPORTANCE_LOW))
+                  val stopPi = PendingIntent.getService(this, 0, Intent(this, AssistService::class.java).setAction("stop"), PendingIntent.FLAG_IMMUTABLE)
+                  val n = Notification.Builder(this, "q").setContentTitle("QUREO AI").setContentText(t("running"))
+                      .setSmallIcon(android.R.drawable.ic_menu_search)
+                      .addAction(Notification.Action.Builder(Icon.createWithResource(this, android.R.drawable.ic_delete), "Stop", stopPi).build()).build()
+                  // Must be called before getMediaProjection() on Android 14+.
+                  startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  val data = IntentCompat.getParcelableExtra(i, "data", Intent::class.java)
+                  if (data == null) { stopSelf(); return START_NOT_STICKY }
+                  try {
+                      setupProjection(i.getIntExtra("code", 0), data)
+                      buildUi()
+                      startAuto()
+                  } catch (e: Exception) { stopSelf() }
+                  return START_NOT_STICKY
+              }
+
+              private fun setupProjection(code: Int, data: Intent) {
+                  val m = getSystemService(MediaProjectionManager::class.java)
+                  val p = m.getMediaProjection(code, data)
+                  mp = p
+                  // Android 14+: callback must be registered before creating the VirtualDisplay.
+                  p.registerCallback(object : MediaProjection.Callback() { override fun onStop() { stopSelf() } }, Handler(Looper.getMainLooper()))
+                  val dm = resources.displayMetrics
+                  w = dm.widthPixels; h = dm.heightPixels
+                  val r = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 3)
+                  r.setOnImageAvailableListener({ x ->
+                      val n = x.acquireLatestImage()
+                      if (n != null) { held?.close(); held = n }
+                  }, Handler(Looper.getMainLooper()))
+                  ir = r
+                  vd = p.createVirtualDisplay("q", w, h, dm.densityDpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, r.surface, null, null)
+              }
+
+              private fun grab(): Bitmap? {
+                  val im = held ?: return null
+                  val p = im.planes[0]
+                  val full = Bitmap.createBitmap(p.rowStride / p.pixelStride, h, Bitmap.Config.ARGB_8888)
+                  p.buffer.rewind(); full.copyPixelsFromBuffer(p.buffer)
+                  return if (full.width == w) full else Bitmap.createBitmap(full, 0, 0, w, h).also { full.recycle() }
+              }
+
+              private fun encode(bm: Bitmap): String {
+                  val k = minOf(1f, 2000f / maxOf(bm.width, bm.height))
+                  val s = if (k < 1f) Bitmap.createScaledBitmap(bm, (bm.width * k).toInt(), (bm.height * k).toInt(), true) else bm
+                  val o = ByteArrayOutputStream(); s.compress(Bitmap.CompressFormat.JPEG, 85, o)
+                  return Base64.encodeToString(o.toByteArray(), Base64.NO_WRAP)
+              }
+
+              /** Cheap luminance signature of the top 55% of the screen (the panel sits at the bottom). */
+              private fun sig(bm: Bitmap): IntArray {
+                  val top = Bitmap.createBitmap(bm, 0, 0, bm.width, (bm.height * 0.55f).toInt())
+                  val s = Bitmap.createScaledBitmap(top, 20, 24, true)
+                  val a = IntArray(20 * 24); s.getPixels(a, 0, 20, 0, 0, 20, 24)
+                  return IntArray(a.size) { (Color.red(a[it]) * 3 + Color.green(a[it]) * 6 + Color.blue(a[it])) / 10 }
+              }
+
+              private fun startAuto() = scope.launch {
+                  while (isActive) {
+                      delay(2500)
+                      if (!Store.auto(this@AssistService) || busy) continue
+                      val bm = grab() ?: continue
+                      val s = sig(bm); bm.recycle()
+                      val p = sigPrev; sigPrev = s
+                      if (p == null) continue
+                      var sum = 0
+                      for (j in s.indices) sum += abs(s[j] - p[j])
+                      val d = sum / s.size
+                      if (d > 14) moving = true
+                      else if (moving && d < 4) { moving = false; flagNew() }
+                  }
+              }
+
+              private fun flagNew() {
+                  bubble?.apply { text = "!"; background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(0xFFFF8A00.toInt()) } }
+                  if (panel?.visibility == View.VISIBLE && !busy) status.text = t("newex")
+              }
+
+              private fun solve() {
+                  if (busy) return
+                  val key = Store.apiKey(this)
+                  if (key.isBlank()) { status.text = t("nokey"); return }
+                  busy = true; solveBtn.isEnabled = false; status.text = t("scan")
+                  setHidden(true)
+                  scope.launch {
+                      try {
+                          delay(450) // let the overlay disappear from the next captured frame
+                          val bm = grab()
+                          setHidden(false)
+                          if (bm == null) { status.text = t("err") + ": no frame"; return@launch }
+                          val b64 = withContext(Dispatchers.Default) { encode(bm) }
+                          bm.recycle()
+                          status.text = t("think")
+                          val r = withContext(Dispatchers.IO) { Claude.solve(key, arrayOf("English", "Arabic", "French")[lang], b64) }
+                          last = r; showWhy = false
+                          if (r.ok) render() else status.text = t("cant") + (if (r.why.isNotBlank()) ": " + r.why else "")
+                      } catch (e: Exception) {
+                          setHidden(false); status.text = t("err") + ": " + (e.message ?: "").take(160)
+                      } finally {
+                          setHidden(false); busy = false; solveBtn.isEnabled = true
+                          sigPrev = null; moving = false
+                      }
+                  }
+              }
+
+              private fun setHidden(hid: Boolean) { val a = if (hid) 0f else 1f; bubble?.alpha = a; panel?.alpha = a }
+
+              private fun render() {
+                  val r = last ?: return
+                  ansTv.text = r.answer + if (showWhy && r.why.isNotBlank()) "\n\n" + r.why else ""
+                  codeTv.text = r.code; codeTv.visibility = if (r.code.isBlank()) View.GONE else View.VISIBLE
+                  scroll.visibility = View.VISIBLE; actions.visibility = View.VISIBLE
+                  status.text = if (r.verified) t("verified") else t("unver") + if (r.note.isNotBlank()) ": " + r.note else ""
+              }
+
+              private fun btn(txt: String, color: Int, cb: () -> Unit) = Button(this).apply {
+                  text = txt; isAllCaps = false; setTextColor(Color.WHITE); background = round(color, dp(12).toFloat()); setOnClickListener { cb() }
+              }
+
+              private fun buildUi() {
+                  wm = getSystemService(WindowManager::class.java)
+                  val type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                  val b = TextView(this).apply {
+                      text = "Q"; textSize = 22f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+                      background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(0xFF5B4BFF.toInt()) }
+                  }
+                  val blp = WindowManager.LayoutParams(dp(52), dp(52), type, WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT)
+                      .apply { gravity = Gravity.TOP or Gravity.START; x = dp(8); y = dp(220) }
+                  var sx = 0; var sy = 0; var tx = 0f; var ty = 0f; var moved = false
+                  b.setOnTouchListener { v, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> { sx = blp.x; sy = blp.y; tx = e.rawX; ty = e.rawY; moved = false }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = e.rawX - tx; val dy = e.rawY - ty
+                              if (abs(dx) > 10 || abs(dy) > 10) moved = true
+                              blp.x = sx + dx.toInt(); blp.y = sy + dy.toInt(); wm.updateViewLayout(v, blp)
+                          }
+                          MotionEvent.ACTION_UP -> if (!moved) setOpen(true)
+                      }
+                      true
+                  }
+                  bubble = b
+
+                  val p = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; setPadding(dp(14), dp(10), dp(14), dp(14))
+                      background = round(0xF2161B31.toInt(), dp(18).toFloat()); visibility = View.GONE
+                      layoutDirection = if (lang == 1) View.LAYOUT_DIRECTION_RTL else View.LAYOUT_DIRECTION_LTR
+                  }
+                  val head = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+                  head.addView(TextView(this).apply { text = "QUREO AI"; textSize = 16f; setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD }, LinearLayout.LayoutParams(0, -2, 1f))
+                  head.addView(btn("—", 0x33FFFFFF) { setOpen(false) }, LinearLayout.LayoutParams(dp(52), dp(40)))
+                  p.addView(head)
+                  status = TextView(this).apply { text = t("ready"); textSize = 13f; setTextColor(0xFFB8BEDD.toInt()); setPadding(0, dp(4), 0, dp(8)) }
+                  p.addView(status)
+                  solveBtn = btn("⚡ " + t("solve"), 0xFF5B4BFF.toInt()) { solve() }.apply { textSize = 18f; typeface = Typeface.DEFAULT_BOLD }
+                  p.addView(solveBtn, LinearLayout.LayoutParams(-1, dp(56)))
+                  ansTv = TextView(this).apply { textSize = 17f; setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD }
+                  codeTv = TextView(this).apply {
+                      textSize = 12f; setTextColor(0xFFCDD3FF.toInt()); typeface = Typeface.MONOSPACE; setPadding(dp(8), dp(8), dp(8), dp(8))
+                      background = round(0xFF0B0E1F.toInt(), dp(8).toFloat()); layoutDirection = View.LAYOUT_DIRECTION_LTR; textDirection = View.TEXT_DIRECTION_LTR
+                  }
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(8), 0, 0) }
+                  box.addView(ansTv); box.addView(codeTv, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+                  scroll = ScrollView(this).apply { visibility = View.GONE; addView(box) }
+                  p.addView(scroll, LinearLayout.LayoutParams(-1, (h * 0.28f).toInt()))
+                  actions = LinearLayout(this).apply { visibility = View.GONE; setPadding(0, dp(8), 0, 0) }
+                  actions.addView(btn(t("explain"), 0x33FFFFFF) { showWhy = !showWhy; render() }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(8) })
+                  actions.addView(btn(t("copy"), 0x33FFFFFF) {
+                      val r = last ?: return@btn
+                      getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("a", r.code.ifBlank { r.answer }))
+                  }, LinearLayout.LayoutParams(0, dp(44), 1f))
+                  p.addView(actions)
+                  val plp = WindowManager.LayoutParams(w * 92 / 100, -2, type,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL, PixelFormat.TRANSLUCENT)
+                      .apply { gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL; y = dp(12) }
+                  panel = p
+                  wm.addView(p, plp)
+                  wm.addView(b, blp)
+              }
+
+              private fun setOpen(open: Boolean) {
+                  panel?.visibility = if (open) View.VISIBLE else View.GONE
+                  bubble?.apply {
+                      visibility = if (open) View.GONE else View.VISIBLE
+                      if (open) { text = "Q"; background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(0xFF5B4BFF.toInt()) } }
+                  }
+              }
+
+              override fun onDestroy() {
+                  scope.cancel()
+                  runCatching { bubble?.let { wm.removeView(it) } }
+                  runCatching { panel?.let { wm.removeView(it) } }
+                  held?.close(); vd?.release(); ir?.close(); mp?.stop()
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+
+      - run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+      - run: gradle :app:assembleRelease --no-daemon
+      - uses: actions/upload-artifact@v4
+        with: { name: qureo-ai-apk, path: app/build/outputs/apk/release/*.apk }
